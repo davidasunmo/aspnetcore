@@ -1,25 +1,64 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Security.AccessControl;
+using System.Security.Principal;
 using Microsoft.AspNetCore.InternalTesting;
 using Microsoft.AspNetCore.Server.IIS.FunctionalTests.Utilities;
+using Microsoft.AspNetCore.Server.IntegrationTesting.IIS;
 
 namespace Microsoft.AspNetCore.Server.IIS.FunctionalTests;
 
 [Collection(PublishedSitesCollection.Name)]
-public class ShadowCopyTests : IISFunctionalTestBase
+public class ShadowCopyTests(PublishedSitesFixture fixture) : IISFunctionalTestBase(fixture)
 {
-    public ShadowCopyTests(PublishedSitesFixture fixture) : base(fixture)
+
+    public bool IsDirectoryEmpty(string path)
     {
+        return !Directory.EnumerateFileSystemEntries(path).Any();
+    }
+
+    public static NTAccount DefaultAppPoolAccount { get; } = new NTAccount("IIS AppPool", "DefaultAppPool");
+
+    [ConditionalFact]
+    public async Task ShadowCopy_CopyFailsWithUsefulExceptionMessage_WhenNoPermissionsToShadowCopyDirectory()
+    {
+        // Arrange
+        using var shadowCopyDirectory = TempDirectory.CreateWithNoPermissions(DefaultAppPoolAccount);
+        var deploymentParameters = Fixture.GetBaseDeploymentParameters();
+        deploymentParameters.HandlerSettings["enableShadowCopy"] = "true";
+        deploymentParameters.HandlerSettings["shadowCopyDirectory"] = shadowCopyDirectory.DirectoryPath;
+
+        deploymentParameters.ServerConfigActionList.Add((config, _) =>
+        {
+            var appPools = config.RequiredElement("system.applicationHost").RequiredElement("applicationPools");
+
+            var defaultAppPool = appPools.Elements("add")
+                    .FirstOrDefault(m => m.Attribute("name")?.Value == "DefaultAppPool");
+
+            Assert.NotNull(defaultAppPool);
+
+            defaultAppPool.RequiredElement("processModel")
+                          .SetAttributeValue("identityType", "ApplicationPoolIdentity");
+        });
+
+        var deploymentResult = await DeployAsync(deploymentParameters);
+
+        // Act
+        var response = await deploymentResult.HttpClient.GetAsync("Wow!");
+
+        // Assert
+        Assert.False(response.IsSuccessStatusCode);
+        Assert.True(IsDirectoryEmpty(shadowCopyDirectory.DirectoryPath), "Expected shadow copy shadowCopyDirectory to be empty");
     }
 
     [ConditionalFact]
     public async Task ShadowCopyDoesNotLockFiles()
     {
-        using var directory = TempDirectory.Create();
+        using var shadowCopyDirectory = TempDirectory.Create();
         var deploymentParameters = Fixture.GetBaseDeploymentParameters();
         deploymentParameters.HandlerSettings["enableShadowCopy"] = "true";
-        deploymentParameters.HandlerSettings["shadowCopyDirectory"] = directory.DirectoryPath;
+        deploymentParameters.HandlerSettings["shadowCopyDirectory"] = shadowCopyDirectory.DirectoryPath;
 
         var deploymentResult = await DeployAsync(deploymentParameters);
         var response = await deploymentResult.HttpClient.GetAsync("Wow!");
@@ -42,14 +81,17 @@ public class ShadowCopyTests : IISFunctionalTestBase
     [ConditionalFact]
     public async Task ShadowCopyRelativeInSameDirectoryWorks()
     {
+        // Arrange
         var directoryName = Path.GetRandomFileName();
         var deploymentParameters = Fixture.GetBaseDeploymentParameters();
         deploymentParameters.HandlerSettings["enableShadowCopy"] = "true";
         deploymentParameters.HandlerSettings["shadowCopyDirectory"] = directoryName;
 
+        // Act
         var deploymentResult = await DeployAsync(deploymentParameters);
         var response = await deploymentResult.HttpClient.GetAsync("Wow!");
 
+        // Assert
         Assert.True(response.IsSuccessStatusCode);
         var directoryInfo = new DirectoryInfo(deploymentResult.ContentRoot);
 
@@ -81,7 +123,7 @@ public class ShadowCopyTests : IISFunctionalTestBase
         var deploymentResult = await DeployAsync(deploymentParameters);
         var response = await deploymentResult.HttpClient.GetAsync("Wow!");
 
-        // Check if directory can be deleted.
+        // Check if shadowCopyDirectory can be deleted.
         // Can't delete the folder but can delete all content in it.
 
         Assert.True(response.IsSuccessStatusCode);
@@ -157,7 +199,7 @@ public class ShadowCopyTests : IISFunctionalTestBase
         await AssertAppOffline(deploymentResult);
 
         // Delete folder + file after app is shut down
-        // Testing specific path on startup where we compare the app directory contents with the shadow copy directory
+        // Testing specific path on startup where we compare the app shadowCopyDirectory contents with the shadow copy shadowCopyDirectory
         Directory.Delete(deleteDirPath, recursive: true);
 
         RemoveAppOffline(deploymentResult.ContentRoot);
@@ -171,13 +213,13 @@ public class ShadowCopyTests : IISFunctionalTestBase
     [ConditionalFact]
     public async Task ShadowCopyE2EWorksWithFolderPresent()
     {
-        using var directory = TempDirectory.Create();
+        using var shadowCopyDirectory = TempDirectory.Create();
         var deploymentParameters = Fixture.GetBaseDeploymentParameters();
         deploymentParameters.HandlerSettings["enableShadowCopy"] = "true";
-        deploymentParameters.HandlerSettings["shadowCopyDirectory"] = directory.DirectoryPath;
+        deploymentParameters.HandlerSettings["shadowCopyDirectory"] = shadowCopyDirectory.DirectoryPath;
         var deploymentResult = await DeployAsync(deploymentParameters);
 
-        DirectoryCopy(deploymentResult.ContentRoot, Path.Combine(directory.DirectoryPath, "0"), copySubDirs: true);
+        DirectoryCopy(deploymentResult.ContentRoot, Path.Combine(shadowCopyDirectory.DirectoryPath, "0"), copySubDirs: true);
 
         var response = await deploymentResult.HttpClient.GetAsync("Wow!");
         Assert.True(response.IsSuccessStatusCode);
@@ -216,7 +258,7 @@ public class ShadowCopyTests : IISFunctionalTestBase
         DirectoryCopy(secondTempDir.DirectoryPath, deploymentResult.ContentRoot, copySubDirs: true);
 
         response = await deploymentResult.HttpClient.GetAsync("Wow!");
-        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "0")), "Expected 0 shadow copy directory to be skipped");
+        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "0")), "Expected 0 shadow copy shadowCopyDirectory to be skipped");
 
         // Depending on timing, this could result in a shutdown failure, but sometimes it succeeds, handle both situations
         if (!response.IsSuccessStatusCode)
@@ -224,10 +266,10 @@ public class ShadowCopyTests : IISFunctionalTestBase
             Assert.True(response.ReasonPhrase == "Application Shutting Down" || response.ReasonPhrase == "Server has been shutdown");
         }
 
-        // This shutdown should trigger a copy to the next highest directory, which will be 2
+        // This shutdown should trigger a copy to the next highest shadowCopyDirectory, which will be 2
         await deploymentResult.AssertRecycledAsync();
 
-        Assert.True(Directory.Exists(Path.Combine(directory.DirectoryPath, "2")), "Expected 2 shadow copy directory");
+        Assert.True(Directory.Exists(Path.Combine(directory.DirectoryPath, "2")), "Expected 2 shadow copy shadowCopyDirectory");
 
         response = await deploymentResult.HttpClient.GetAsync("Wow!");
         Assert.True(response.IsSuccessStatusCode);
@@ -258,7 +300,7 @@ public class ShadowCopyTests : IISFunctionalTestBase
         DirectoryCopy(secondTempDir.DirectoryPath, deploymentResult.ContentRoot, copySubDirs: true);
 
         response = await deploymentResult.HttpClient.GetAsync("Wow!");
-        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "0")), "Expected 0 shadow copy directory to be skipped");
+        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "0")), "Expected 0 shadow copy shadowCopyDirectory to be skipped");
 
         // Depending on timing, this could result in a shutdown failure, but sometimes it succeeds, handle both situations
         if (!response.IsSuccessStatusCode)
@@ -266,17 +308,17 @@ public class ShadowCopyTests : IISFunctionalTestBase
             Assert.True(response.ReasonPhrase == "Application Shutting Down" || response.ReasonPhrase == "Server has been shutdown");
         }
 
-        // This shutdown should trigger a copy to the next highest directory, which will be 11
+        // This shutdown should trigger a copy to the next highest shadowCopyDirectory, which will be 11
         await deploymentResult.AssertRecycledAsync();
 
-        Assert.True(Directory.Exists(Path.Combine(directory.DirectoryPath, "11")), "Expected 11 shadow copy directory");
+        Assert.True(Directory.Exists(Path.Combine(directory.DirectoryPath, "11")), "Expected 11 shadow copy shadowCopyDirectory");
 
         response = await deploymentResult.HttpClient.GetAsync("Wow!");
         Assert.True(response.IsSuccessStatusCode);
 
         // Verify old directories were cleaned up
-        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "1")), "Expected 1 shadow copy directory to be deleted");
-        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "3")), "Expected 3 shadow copy directory to be deleted");
+        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "1")), "Expected 1 shadow copy shadowCopyDirectory to be deleted");
+        Assert.False(Directory.Exists(Path.Combine(directory.DirectoryPath, "3")), "Expected 3 shadow copy shadowCopyDirectory to be deleted");
     }
 
     [ConditionalFact]
@@ -312,6 +354,7 @@ public class ShadowCopyTests : IISFunctionalTestBase
     [ConditionalFact]
     public async Task ShadowCopyIgnoresItsOwnDirectoryWhenCopying()
     {
+        // Arrange
         using var directory = TempDirectory.Create();
         var deploymentParameters = Fixture.GetBaseDeploymentParameters();
         deploymentParameters.HandlerSettings["enableShadowCopy"] = "true";
@@ -320,7 +363,10 @@ public class ShadowCopyTests : IISFunctionalTestBase
 
         DirectoryCopy(deploymentResult.ContentRoot, Path.Combine(directory.DirectoryPath, "0"), copySubDirs: true);
 
+        // Act
         var response = await deploymentResult.HttpClient.GetAsync("Wow!");
+
+        // Assert
         Assert.True(response.IsSuccessStatusCode);
 
         using var secondTempDir = TempDirectory.Create();
@@ -341,6 +387,8 @@ public class ShadowCopyTests : IISFunctionalTestBase
 
     public class TempDirectory : IDisposable
     {
+        private readonly bool _noPermissions;
+
         public static TempDirectory Create()
         {
             var directoryPath = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -348,11 +396,37 @@ public class ShadowCopyTests : IISFunctionalTestBase
             return new TempDirectory(directoryInfo);
         }
 
-        public TempDirectory(DirectoryInfo directoryInfo)
+        public static TempDirectory CreateWithNoPermissions(NTAccount accountToRestrict)
         {
-            DirectoryInfo = directoryInfo;
+            var directoryPath = Path.Combine($"{Path.GetTempPath()}NoPermissions", Path.GetRandomFileName());
+            var directoryInfo = Directory.CreateDirectory(directoryPath);
+            RemovePermissions(directoryInfo, accountToRestrict);
+            return new TempDirectory(directoryInfo, true);
+        }
 
+        public TempDirectory(DirectoryInfo directoryInfo, bool noPermissions = false)
+        {
+            _noPermissions = noPermissions;
             DirectoryPath = directoryInfo.FullName;
+            DirectoryInfo = directoryInfo;
+        }
+
+        private static void RemovePermissions(DirectoryInfo directoryInfo, NTAccount accountToRestrict)
+        {
+            var directorySecurity = directoryInfo.GetAccessControl();
+
+            directorySecurity.PurgeAccessRules(accountToRestrict);
+            directoryInfo.SetAccessControl(directorySecurity);
+        }
+
+        private static void RestorePermissions(DirectoryInfo directoryInfo, NTAccount accountToRestore)
+        {
+            var directorySecurity = directoryInfo.GetAccessControl();
+            directorySecurity.AddAccessRule(new FileSystemAccessRule(accountToRestore,
+                                                                    FileSystemRights.FullControl,
+                                                                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                                                                    PropagationFlags.None,
+                                                                    AccessControlType.Allow));
         }
 
         public string DirectoryPath { get; }
@@ -360,6 +434,7 @@ public class ShadowCopyTests : IISFunctionalTestBase
 
         public void Dispose()
         {
+            if (_noPermissions) RestorePermissions(DirectoryInfo, DefaultAppPoolAccount);
             DeleteDirectory(DirectoryPath);
         }
 
@@ -384,7 +459,7 @@ public class ShadowCopyTests : IISFunctionalTestBase
             }
             catch (Exception e)
             {
-                Console.WriteLine($@"Failed to delete directory {directoryPath}: {e.Message}");
+                Console.WriteLine($@"Failed to delete shadowCopyDirectory {directoryPath}: {e.Message}");
             }
         }
     }
@@ -392,22 +467,22 @@ public class ShadowCopyTests : IISFunctionalTestBase
     // copied from https://learn.microsoft.com/dotnet/standard/io/how-to-copy-directories
     private static void DirectoryCopy(string sourceDirName, string destDirName, bool copySubDirs, string ignoreDirectory = "")
     {
-        // Get the subdirectories for the specified directory.
+        // Get the subdirectories for the specified shadowCopyDirectory.
         DirectoryInfo dir = new DirectoryInfo(sourceDirName);
 
         if (!dir.Exists)
         {
             throw new DirectoryNotFoundException(
-                "Source directory does not exist or could not be found: "
+                "Source shadowCopyDirectory does not exist or could not be found: "
                 + sourceDirName);
         }
 
         DirectoryInfo[] dirs = dir.GetDirectories();
 
-        // If the destination directory doesn't exist, create it.
+        // If the destination shadowCopyDirectory doesn't exist, create it.
         Directory.CreateDirectory(destDirName);
 
-        // Get the files in the directory and copy them to the new location.
+        // Get the files in the shadowCopyDirectory and copy them to the new location.
         FileInfo[] files = dir.GetFiles();
         foreach (FileInfo file in files)
         {
